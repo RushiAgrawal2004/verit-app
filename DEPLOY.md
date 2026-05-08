@@ -221,6 +221,67 @@ Expected: `{"status":"healthy","model_name":"universalfakedetect","model_loaded"
 
 ---
 
+# PART 2C — Deploy the strong image model (modern ViT classifier)
+
+This adds a third image-detection Space using a modern ViT-based classifier (`dima806/ai_vs_real_image_detection`, ~340 MB). It's the strongest single signal in the ensemble for modern AI generators (ChatGPT/`gpt-image-1`, Midjourney v6+, FLUX, Imagen 3) — recommended.
+
+### 2C.1 Create the Space
+
+Same as 2.1 but name it **`verit-image-strong`**.
+
+### 2C.2 Clone the empty Space
+
+```powershell
+cd e:\deepmedia
+git clone https://huggingface.co/spaces/YOUR_HF_NAME/verit-image-strong
+cd verit-image-strong
+```
+
+### 2C.3 Copy the prepared files (no SDK needed for this Space)
+
+```powershell
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-strong\Dockerfile .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-strong\requirements.txt .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-strong\app.py .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-strong\README.md .
+```
+
+### 2C.4 Push
+
+```powershell
+git add -A
+git commit -m "deploy strong image detector"
+git push
+```
+
+### 2C.5 Wait for build
+
+Open `https://huggingface.co/spaces/YOUR_HF_NAME/verit-image-strong` → **Logs** tab.
+
+- Build takes **8–14 min** — most of it is the model pre-download (~340 MB) at Docker build time so the first inference is fast.
+- When you see `Uvicorn running on http://0.0.0.0:7860` → ready.
+
+### 2C.6 Test
+
+```powershell
+curl https://YOUR_HF_NAME-verit-image-strong.hf.space/health
+```
+Expected:
+```json
+{"status":"healthy","model_id":"dima806/ai_vs_real_image_detection","model_loaded":true}
+```
+
+📋 **Save this URL**: `https://YOUR_HF_NAME-verit-image-strong.hf.space`
+
+> ⚠️ **The orchestrator must know about this Space.** After Part 4, add an env var to Render:
+> | Key | Value |
+> |---|---|
+> | `DEEPSAFE_URL_STRONG` | `https://YOUR_HF_NAME-verit-image-strong.hf.space` |
+>
+> Default ensemble weights when this var is set: NPR=0.15, UF=0.35, Strong=0.50. To swap the underlying model later (e.g. to a newer detector), set the `MODEL_ID` Space-secret in HuggingFace and rebuild.
+
+---
+
 # PART 3 — Deploy the Video AI to HuggingFace Spaces
 
 The video service needs the model weights (`efficientnet.onnx`, `model.pth`) and the inference code from `AI-Generated-Video-Detector/`. We use Git LFS for the large weight files.
@@ -341,9 +402,12 @@ Scroll down to **Environment Variables** → click **Add Environment Variable** 
 | `VIDEO_URL` | `https://YOUR_HF_NAME-verit-video.hf.space` |
 | `DEEPSAFE_MODE` | `single_model` |
 | `REQUEST_TIMEOUT` | `600` |
-| `DEEPSAFE_URL_UF` *(optional)* | `https://YOUR_HF_NAME-verit-image-uf.hf.space` |
+| `DEEPSAFE_URL_UF` *(optional, Part 2B)* | `https://YOUR_HF_NAME-verit-image-uf.hf.space` |
+| `DEEPSAFE_URL_STRONG` *(optional, Part 2C)* | `https://YOUR_HF_NAME-verit-image-strong.hf.space` |
 
-> When `DEEPSAFE_URL_UF` is set, the orchestrator runs an ensemble (NPR + UniversalFakeDetect, averaged). It also runs a metadata pre-check on every image — if known AI-generation tags (Stable Diffusion, Midjourney, Adobe Firefly, C2PA AI claims, etc.) are found in EXIF/XMP/C2PA, it short-circuits with `service: "metadata"`. Removing the var disables the ensemble; the metadata check stays.
+> The orchestrator calls every configured image Space in parallel and combines the probabilities with a weighted ensemble. Default weights: **NPR=0.15, UF=0.35, Strong=0.50**. AI verdict fires when `weighted_avg ≥ 0.40` OR any single model returns ≥ 0.55. Tunable at runtime via `ENSEMBLE_WEIGHT_NPR`, `ENSEMBLE_WEIGHT_UF`, `ENSEMBLE_WEIGHT_STRONG`, `AI_THRESHOLD`, `ENSEMBLE_AGGRESSIVE_MAX`.
+>
+> Independently, the orchestrator runs a metadata pre-check on every image — if known AI-generation tags (Stable Diffusion, Midjourney, ChatGPT/DALL·E, Adobe Firefly, Bing/Designer, Imagen, Gemini, Apple/Samsung/Google AI features, C2PA AI claims, etc.) are found in EXIF/XMP/C2PA, it short-circuits with `service: "metadata"` and `ai_probability: 0.95`. This works whether or not the ensemble services are configured.
 
 ### 4.4 Deploy
 

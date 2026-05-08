@@ -13,9 +13,12 @@ from metadata_check import MetadataFinding, check as metadata_check
 logger = logging.getLogger("orchestrator")
 
 DEEPSAFE_URL = os.getenv("DEEPSAFE_URL", "http://localhost:5001").rstrip("/")
-# Optional second image service. When set, image requests are sent to both
-# Spaces in parallel and combined.
+# Optional second image service (UniversalFakeDetect — CLIP ViT-L/14).
 DEEPSAFE_URL_UF = os.getenv("DEEPSAFE_URL_UF", "").rstrip("/")
+# Optional third image service (a strong modern ViT classifier such as
+# dima806/ai_vs_real_image_detection). When set, all image requests go
+# to NPR + UF + Strong in parallel and the probabilities are combined.
+DEEPSAFE_URL_STRONG = os.getenv("DEEPSAFE_URL_STRONG", "").rstrip("/")
 # DEEPSAFE_MODE: "single_model" -> POST /predict with base64 JSON (a single DeepSafe model service)
 #                "orchestrator" -> POST /detect with multipart file (the full DeepSafe API on port 8000)
 DEEPSAFE_MODE = os.getenv("DEEPSAFE_MODE", "single_model").lower()
@@ -23,11 +26,14 @@ VIDEO_URL = os.getenv("VIDEO_URL", "http://localhost:5005").rstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 
 # ── Ensemble tuning (all env-var configurable) ──────────────────────────
-# UF (CLIP ViT-L/14 + linear head) generalizes much better to modern
-# diffusion models (ChatGPT image, Midjourney v6, Flux, Imagen 3) than NPR
-# (ResNet-50 trained mostly on older GAN data). So UF gets the higher weight.
-W_NPR = float(os.getenv("ENSEMBLE_WEIGHT_NPR", "0.30"))
-W_UF = float(os.getenv("ENSEMBLE_WEIGHT_UF", "0.70"))
+# Defaults assume all three services are available. NPR is the weakest on
+# modern diffusion (it's GAN-era) so it gets the smallest weight; UF
+# (CLIP-based) is moderately strong; Strong (modern ViT classifier) is the
+# main signal. Weights are normalized at runtime to sum to 1, so dropping
+# a service just rescales the others — no need to retune when toggling.
+W_NPR = float(os.getenv("ENSEMBLE_WEIGHT_NPR", "0.15"))
+W_UF = float(os.getenv("ENSEMBLE_WEIGHT_UF", "0.35"))
+W_STRONG = float(os.getenv("ENSEMBLE_WEIGHT_STRONG", "0.50"))
 # Decision threshold on the weighted probability. Lower than 0.5 because
 # CPU-only detectors trained on older data tend to under-predict on modern
 # AI generators — we accept some false-positive risk to reduce FN.
@@ -42,7 +48,7 @@ METADATA_PROB = float(os.getenv("METADATA_PROB", "0.95"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
-app = FastAPI(title="AI Detection Orchestrator", version="1.2.0")
+app = FastAPI(title="AI Detection Orchestrator", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,6 +155,8 @@ def _model_weight(label: str) -> float:
         return W_NPR
     if label == "uf":
         return W_UF
+    if label == "strong":
+        return W_STRONG
     return 1.0
 
 
@@ -244,6 +252,8 @@ async def health():
     targets = [("deepsafe", DEEPSAFE_URL), ("video", VIDEO_URL)]
     if DEEPSAFE_URL_UF:
         targets.insert(1, ("deepsafe_uf", DEEPSAFE_URL_UF))
+    if DEEPSAFE_URL_STRONG:
+        targets.insert(-1, ("deepsafe_strong", DEEPSAFE_URL_STRONG))
     async with httpx.AsyncClient(timeout=5.0) as client:
         for name, url in targets:
             try:
@@ -283,11 +293,13 @@ async def detect(file: UploadFile = File(...)):
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=err)
             return normalize_image_response_orchestrator(data)
 
-        # 3) single_model mode: call NPR (and UF if configured) in parallel.
+        # 3) single_model mode: call NPR (and UF / Strong if configured) in parallel.
         image_b64 = base64.b64encode(payload).decode("ascii")
         targets: List[Tuple[str, str]] = [("npr", DEEPSAFE_URL)]
         if DEEPSAFE_URL_UF:
             targets.append(("uf", DEEPSAFE_URL_UF))
+        if DEEPSAFE_URL_STRONG:
+            targets.append(("strong", DEEPSAFE_URL_STRONG))
 
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             calls = [_call_single_model(client, url, image_b64) for _, url in targets]
