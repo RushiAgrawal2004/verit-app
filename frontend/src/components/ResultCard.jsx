@@ -2,7 +2,7 @@ import React from 'react';
 
 export default function ResultCard({ result }) {
   const isAi = result.verdict === 'AI';
-  const pct = Math.max(0, Math.min(100, Math.round((result.confidence || 0) * 100)));
+  const pct = Number(((result.confidence || 0) * 100).toFixed(2));
 
   const verdictTitle = isAi ? 'Likely AI-generated' : 'Likely real';
   const accent = isAi
@@ -28,7 +28,7 @@ export default function ResultCard({ result }) {
 
       <div className="space-y-2.5">
         <div className="flex items-baseline justify-between">
-          <span className="text-sm text-ink-600">Confidence</span>
+          <span className="text-sm text-ink-600">Model Confidence</span>
           <span className="text-2xl font-semibold text-ink-900 tabular-nums">{pct}%</span>
         </div>
         <div className="h-2 rounded-full bg-ink-100 overflow-hidden">
