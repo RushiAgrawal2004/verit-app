@@ -152,6 +152,75 @@ Expected: `{"status":"healthy"}`
 
 ---
 
+# PART 2B — Deploy the second image model (UniversalFakeDetect)
+
+This adds a second image-detection Space that the orchestrator ensembles alongside NPR. **Skip this part if you only want the single NPR model.**
+
+### 2B.1 Create the Space
+
+Same as 2.1 but name it **`verit-image-uf`**.
+
+### 2B.2 Clone the empty Space
+
+```powershell
+cd e:\deepmedia
+git clone https://huggingface.co/spaces/YOUR_HF_NAME/verit-image-uf
+cd verit-image-uf
+```
+
+### 2B.3 Copy the prepared files
+
+```powershell
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-uf\Dockerfile .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-uf\requirements.txt .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-uf\detector.py .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-uf\model.yaml .
+Copy-Item e:\deepmedia\ai-detection-app\hf-image-space-uf\README.md .
+Copy-Item -Recurse e:\deepmedia\DeepSafe\sdk .\sdk
+```
+
+Strip cruft so the push is clean:
+
+```powershell
+Get-ChildItem -Recurse -Force -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+Get-ChildItem -Recurse -Force -Directory -Filter "*.egg-info" | Remove-Item -Recurse -Force
+Get-ChildItem -Recurse -Force -Directory -Filter "tests" | Where-Object { $_.FullName -like "*\sdk\*" } | Remove-Item -Recurse -Force
+```
+
+### 2B.4 Push
+
+```powershell
+git add -A
+git commit -m "deploy universalfakedetect image space"
+git push
+```
+
+### 2B.5 Wait for build
+
+Open `https://huggingface.co/spaces/YOUR_HF_NAME/verit-image-uf` → **Logs** tab.
+
+- Build takes **8–12 min** (torch CPU + CLIP ViT-L/14 weights ~890 MB).
+- When you see `Uvicorn running on http://0.0.0.0:7860` → ready.
+
+### 2B.6 Test
+
+```powershell
+curl https://YOUR_HF_NAME-verit-image-uf.hf.space/health
+```
+
+Expected: `{"status":"healthy","model_name":"universalfakedetect","model_loaded":true}`
+
+📋 **Save this URL**: `https://YOUR_HF_NAME-verit-image-uf.hf.space`
+
+> ⚠️ **The orchestrator must know about this Space.** After Part 4, add an env var to Render:
+> | Key | Value |
+> |---|---|
+> | `DEEPSAFE_URL_UF` | `https://YOUR_HF_NAME-verit-image-uf.hf.space` |
+>
+> When this var is set, the orchestrator calls both image Spaces in parallel and averages their probabilities. When unset (or removed), it falls back to NPR-only — no code change needed.
+
+---
+
 # PART 3 — Deploy the Video AI to HuggingFace Spaces
 
 The video service needs the model weights (`efficientnet.onnx`, `model.pth`) and the inference code from `AI-Generated-Video-Detector/`. We use Git LFS for the large weight files.
@@ -264,7 +333,7 @@ Expected: `{"status":"healthy"}`
 
 ### 4.3 Add environment variables
 
-Scroll down to **Environment Variables** → click **Add Environment Variable** four times:
+Scroll down to **Environment Variables** → click **Add Environment Variable** for each row below. The last one (`DEEPSAFE_URL_UF`) is **only needed if you completed Part 2B**:
 
 | Key | Value |
 |---|---|
@@ -272,6 +341,9 @@ Scroll down to **Environment Variables** → click **Add Environment Variable** 
 | `VIDEO_URL` | `https://YOUR_HF_NAME-verit-video.hf.space` |
 | `DEEPSAFE_MODE` | `single_model` |
 | `REQUEST_TIMEOUT` | `600` |
+| `DEEPSAFE_URL_UF` *(optional)* | `https://YOUR_HF_NAME-verit-image-uf.hf.space` |
+
+> When `DEEPSAFE_URL_UF` is set, the orchestrator runs an ensemble (NPR + UniversalFakeDetect, averaged). It also runs a metadata pre-check on every image — if known AI-generation tags (Stable Diffusion, Midjourney, Adobe Firefly, C2PA AI claims, etc.) are found in EXIF/XMP/C2PA, it short-circuits with `service: "metadata"`. Removing the var disables the ensemble; the metadata check stays.
 
 ### 4.4 Deploy
 

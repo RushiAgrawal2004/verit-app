@@ -1,5 +1,7 @@
 numpy>=1.23.0,<2.0
-scipy
-scikit-learn
+ftfy
+regex
+setuptools<70
+tqdm
 opencv-python-headless
 python-multipart

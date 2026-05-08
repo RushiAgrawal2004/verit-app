@@ -1,0 +1,15 @@
+name: universalfakedetect
+version: "1.0.0"
+media_type: image
+model_class: detector.UniversalFakeDetector
+port: 7860
+
+weights:
+  - url: https://github.com/WisconsinAIVision/UniversalFakeDetect/raw/main/pretrained_weights/fc_weights.pth
+    path: universalfakedetect/pretrained_weights/fc_weights.pth
+    sha256: ""
+
+environment:
+  PRELOAD_MODEL: "true"
+  MODEL_TIMEOUT: "0"
+  USE_GPU: "false"

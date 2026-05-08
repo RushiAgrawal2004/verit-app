@@ -8,10 +8,10 @@ app_port: 7860
 pinned: false
 ---
 
-# Verit Image AI
+# Verit Image AI — DeepSafe NPR detector
 
 FastAPI service for AI-generated image detection.
-Uses an ensemble of HuggingFace deepfake classifiers + MTCNN face cropping.
+Uses DeepSafe's `npr_deepfakedetection` model (ResNet-50 on Neighbor Pixel Relations features).
 
 POST `/predict` with JSON body:
 ```json

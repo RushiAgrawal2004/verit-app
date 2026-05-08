@@ -1,12 +1,21 @@
+import asyncio
 import base64
+import logging
 import os
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
+from metadata_check import MetadataFinding, check as metadata_check
+
+logger = logging.getLogger("orchestrator")
+
 DEEPSAFE_URL = os.getenv("DEEPSAFE_URL", "http://localhost:5001").rstrip("/")
+# Optional second image service. When set, image requests are sent to both
+# Spaces in parallel and the probabilities are averaged.
+DEEPSAFE_URL_UF = os.getenv("DEEPSAFE_URL_UF", "").rstrip("/")
 # DEEPSAFE_MODE: "single_model" -> POST /predict with base64 JSON (a single DeepSafe model service)
 #                "orchestrator" -> POST /detect with multipart file (the full DeepSafe API on port 8000)
 DEEPSAFE_MODE = os.getenv("DEEPSAFE_MODE", "single_model").lower()
@@ -16,7 +25,7 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
-app = FastAPI(title="AI Detection Orchestrator", version="1.0.0")
+app = FastAPI(title="AI Detection Orchestrator", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,33 +51,101 @@ def detect_media_type(file: UploadFile) -> Optional[str]:
     return None
 
 
-def normalize_image_response(data: dict) -> dict:
-    # Two response shapes supported:
-    #  - Orchestrator /detect: { is_likely_deepfake, deepfake_probability, ... }
-    #  - Single model /predict: { probability, prediction, class, model, inference_time }
-    if "is_likely_deepfake" in data:
-        is_fake = bool(data.get("is_likely_deepfake"))
-        ai_prob = float(data.get("deepfake_probability", 0.5))
-        details = {
-            "model_count": data.get("model_count"),
-            "fake_votes": data.get("fake_votes"),
-            "real_votes": data.get("real_votes"),
-            "response_time": data.get("response_time"),
-        }
-    else:
-        ai_prob = float(data.get("probability", 0.5))
-        is_fake = int(data.get("prediction", 0)) == 1
-        details = {
-            "model": data.get("model"),
-            "inference_time": data.get("inference_time"),
-        }
+def _safe_metadata_check(raw: bytes) -> Optional[MetadataFinding]:
+    try:
+        return metadata_check(raw)
+    except Exception as e:
+        logger.warning("metadata_check raised %s; ignoring", type(e).__name__)
+        return None
+
+
+def metadata_short_circuit(finding: MetadataFinding) -> dict:
+    return {
+        "type": "image",
+        "verdict": "AI",
+        "ai_probability": finding.probability,
+        "confidence": finding.probability,
+        "service": "metadata",
+        "details": {
+            "metadata_source": finding.source,
+            "field": finding.field,
+            "evidence": finding.evidence,
+            "note": "Detected an AI-generation tell in the file's metadata. "
+                    "This is a strong positive signal but can be evaded by "
+                    "stripping metadata.",
+        },
+    }
+
+
+async def _call_single_model(
+    client: httpx.AsyncClient, base_url: str, image_b64: str
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Returns (json_response, None) on success or (None, error_message)."""
+    try:
+        r = await client.post(
+            f"{base_url}/predict",
+            json={"image_data": image_b64, "threshold": 0.5},
+        )
+    except httpx.ConnectError:
+        return None, f"unreachable ({base_url})"
+    except httpx.TimeoutException:
+        return None, f"timeout ({base_url})"
+    except httpx.HTTPError as e:
+        return None, f"{type(e).__name__} ({base_url})"
+
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("detail", r.text[:200])
+        except ValueError:
+            detail = r.text[:200] or f"HTTP {r.status_code}"
+        return None, f"upstream {r.status_code}: {detail}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, "non-JSON response"
+
+
+def normalize_image_response_orchestrator(data: dict) -> dict:
+    """For the full DeepSafe orchestrator path (DEEPSAFE_MODE=orchestrator)."""
+    is_fake = bool(data.get("is_likely_deepfake"))
+    ai_prob = float(data.get("deepfake_probability", 0.5))
     return {
         "type": "image",
         "verdict": "AI" if is_fake else "Real",
         "ai_probability": ai_prob,
         "confidence": ai_prob if is_fake else 1.0 - ai_prob,
         "service": "deepsafe",
-        "details": details,
+        "details": {
+            "model_count": data.get("model_count"),
+            "fake_votes": data.get("fake_votes"),
+            "real_votes": data.get("real_votes"),
+            "response_time": data.get("response_time"),
+        },
+    }
+
+
+def normalize_ensemble(model_results: List[Tuple[str, dict]]) -> dict:
+    """model_results = [(label, json_response), ...] in the order called."""
+    probs = [(label, float(r.get("probability", 0.5))) for label, r in model_results]
+    avg = sum(p for _, p in probs) / len(probs)
+    is_fake = avg >= 0.5
+    components = [
+        {"model": label, "probability": p, "raw_model_id": r.get("model")}
+        for (label, p), (_, r) in zip(probs, model_results)
+    ]
+    service = "ensemble[" + ",".join(label for label, _ in model_results) + "]"
+    if len(model_results) == 1:
+        service = "single[" + model_results[0][0] + "]"
+    return {
+        "type": "image",
+        "verdict": "AI" if is_fake else "Real",
+        "ai_probability": avg,
+        "confidence": avg if is_fake else 1.0 - avg,
+        "service": service,
+        "details": {
+            "components": components,
+            "strategy": "average" if len(model_results) > 1 else "single",
+        },
     }
 
 
@@ -88,8 +165,11 @@ def normalize_video_response(data: dict) -> dict:
 @app.get("/health")
 async def health():
     services = {"orchestrator": "healthy"}
+    targets = [("deepsafe", DEEPSAFE_URL), ("video", VIDEO_URL)]
+    if DEEPSAFE_URL_UF:
+        targets.insert(1, ("deepsafe_uf", DEEPSAFE_URL_UF))
     async with httpx.AsyncClient(timeout=5.0) as client:
-        for name, url in (("deepsafe", DEEPSAFE_URL), ("video", VIDEO_URL)):
+        for name, url in targets:
             try:
                 r = await client.get(f"{url}/health")
                 services[name] = "healthy" if r.status_code == 200 else f"unhealthy ({r.status_code})"
@@ -115,56 +195,79 @@ async def detect(file: UploadFile = File(...)):
         )
 
     if media_type == "image":
-        target_url = DEEPSAFE_URL
-        if DEEPSAFE_MODE == "single_model":
-            target_path = "/predict"
-            request_kwargs = {
-                "json": {
-                    "image_data": base64.b64encode(payload).decode("ascii"),
-                    "threshold": 0.5,
-                },
-            }
-        else:
-            target_path = "/detect"
-            request_kwargs = {
-                "files": {
-                    "file": (
-                        file.filename or "upload",
-                        payload,
-                        file.content_type or "application/octet-stream",
-                    )
-                },
-            }
-    else:
-        target_url = VIDEO_URL
-        target_path = "/predict"
-        request_kwargs = {
-            "files": {
-                "file": (
-                    file.filename or "upload",
-                    payload,
-                    file.content_type or "application/octet-stream",
-                )
-            },
-        }
+        # 1) Metadata short-circuit. Wrapped to never block on parser errors.
+        finding = _safe_metadata_check(payload)
+        if finding is not None:
+            return metadata_short_circuit(finding)
 
+        # 2) DeepSafe orchestrator mode keeps its old single-call path.
+        if DEEPSAFE_MODE != "single_model":
+            data, err = await _call_orchestrator(payload, file)
+            if err:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=err)
+            return normalize_image_response_orchestrator(data)
+
+        # 3) single_model mode: call NPR (and UF if configured) in parallel.
+        image_b64 = base64.b64encode(payload).decode("ascii")
+        targets: List[Tuple[str, str]] = [("npr", DEEPSAFE_URL)]
+        if DEEPSAFE_URL_UF:
+            targets.append(("uf", DEEPSAFE_URL_UF))
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            calls = [_call_single_model(client, url, image_b64) for _, url in targets]
+            outcomes = await asyncio.gather(*calls)
+
+        successes: List[Tuple[str, dict]] = []
+        errors: List[Tuple[str, str]] = []
+        for (label, _), (data, err) in zip(targets, outcomes):
+            if data is not None:
+                successes.append((label, data))
+            else:
+                errors.append((label, err or "unknown error"))
+
+        if not successes:
+            joined = "; ".join(f"{lbl}: {msg}" for lbl, msg in errors)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"All image services failed. {joined}",
+            )
+
+        result = normalize_ensemble(successes)
+        if errors:
+            result["details"]["partial_failure"] = [
+                {"model": lbl, "error": msg} for lbl, msg in errors
+            ]
+        return result
+
+    # Video branch — unchanged.
+    target_url = VIDEO_URL
+    target_path = "/predict"
+    request_kwargs = {
+        "files": {
+            "file": (
+                file.filename or "upload",
+                payload,
+                file.content_type or "application/octet-stream",
+            )
+        },
+    }
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(f"{target_url}{target_path}", **request_kwargs)
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"{media_type.capitalize()} detection service is unreachable at {target_url}.",
+            detail=f"Video detection service is unreachable at {target_url}.",
         )
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=f"{media_type.capitalize()} detection service timed out after {REQUEST_TIMEOUT}s.",
+            detail=f"Video detection service timed out after {REQUEST_TIMEOUT}s.",
         )
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Network error contacting {media_type} service: {type(e).__name__}",
+            detail=f"Network error contacting video service: {type(e).__name__}",
         )
 
     if response.status_code >= 400:
@@ -174,7 +277,7 @@ async def detect(file: UploadFile = File(...)):
             detail = response.text[:300] or f"HTTP {response.status_code}"
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"{media_type.capitalize()} service error: {detail}",
+            detail=f"Video service error: {detail}",
         )
 
     try:
@@ -182,9 +285,39 @@ async def detect(file: UploadFile = File(...)):
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"{media_type.capitalize()} service returned non-JSON response.",
+            detail="Video service returned non-JSON response.",
         )
-
-    if media_type == "image":
-        return normalize_image_response(data)
     return normalize_video_response(data)
+
+
+async def _call_orchestrator(
+    payload: bytes, file: UploadFile
+) -> Tuple[Optional[dict], Optional[str]]:
+    request_kwargs = {
+        "files": {
+            "file": (
+                file.filename or "upload",
+                payload,
+                file.content_type or "application/octet-stream",
+            )
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.post(f"{DEEPSAFE_URL}/detect", **request_kwargs)
+    except httpx.ConnectError:
+        return None, f"DeepSafe orchestrator unreachable at {DEEPSAFE_URL}."
+    except httpx.TimeoutException:
+        return None, f"DeepSafe orchestrator timed out after {REQUEST_TIMEOUT}s."
+    except httpx.HTTPError as e:
+        return None, f"Network error: {type(e).__name__}"
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("detail", r.text[:300])
+        except ValueError:
+            detail = r.text[:300] or f"HTTP {r.status_code}"
+        return None, f"DeepSafe error: {detail}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, "DeepSafe returned non-JSON."
