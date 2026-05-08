@@ -1,0 +1,37 @@
+services:
+  frontend:
+    build: ./frontend
+    container_name: verit-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: verit-backend
+    ports:
+      - "8080:8080"
+    environment:
+      # Override these to point at where DeepSafe + the video service actually run.
+      # Inside the compose network the video-service is reachable as 'video-service'.
+      DEEPSAFE_URL: ${DEEPSAFE_URL:-http://host.docker.internal:8000}
+      VIDEO_URL: http://video-service:5005
+      REQUEST_TIMEOUT: "600"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - video-service
+    restart: unless-stopped
+
+  video-service:
+    build: ./video-service
+    container_name: verit-video-service
+    ports:
+      - "5005:5005"
+    volumes:
+      # Mount the existing AI-Generated-Video-Detector repo unmodified.
+      # Override VIDEO_DETECTOR_PATH to point at your local clone.
+      - ${VIDEO_DETECTOR_PATH:-../AI-Generated-Video-Detector}:/app/video-detector:ro
+    restart: unless-stopped

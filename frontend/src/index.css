@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background-color: #ffffff;
+  color: #0f172a;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer components {
+  .container-narrow {
+    @apply max-w-6xl mx-auto px-6;
+  }
+  .section-eyebrow {
+    @apply inline-block text-xs font-semibold tracking-widest uppercase text-brand-600 mb-3;
+  }
+  .section-heading {
+    @apply text-3xl sm:text-4xl font-semibold tracking-tight text-ink-900;
+  }
+  .section-heading::after {
+    content: '';
+    display: block;
+    width: 56px;
+    height: 4px;
+    background: linear-gradient(90deg, #4f46e5, #818cf8);
+    border-radius: 2px;
+    margin-top: 14px;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg
+           bg-brand-600 text-white text-sm font-medium
+           shadow-soft hover:bg-brand-700 active:bg-brand-800
+           transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed
+           hover:shadow-glow;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg
+           text-sm font-medium text-ink-600 hover:text-ink-900
+           border border-ink-200 hover:border-ink-300 bg-white
+           transition-colors;
+  }
+  .card {
+    @apply bg-white rounded-2xl border border-ink-200 shadow-soft;
+  }
+}
+
+/* subtle grid backdrop for hero */
+.hero-bg {
+  background:
+    radial-gradient(60% 60% at 50% 0%, rgba(99,102,241,0.08), transparent 70%),
+    linear-gradient(180deg, #fafbff 0%, #ffffff 80%);
+}
