@@ -21,12 +21,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Pre-download model weights at build time so the first request is fast
-# and Spaces' boot-health-check timeout is comfortable.
+# Pre-download both models at build time so the first request is fast.
+# Two complementary architectures (Swin + SigLIP) for ensemble diversity.
 RUN python -c "from transformers import AutoImageProcessor, AutoModelForImageClassification; \
-    AutoImageProcessor.from_pretrained('dima806/ai_vs_real_image_detection'); \
-    AutoModelForImageClassification.from_pretrained('dima806/ai_vs_real_image_detection'); \
-    print('weights cached')"
+    [(AutoImageProcessor.from_pretrained(m), AutoModelForImageClassification.from_pretrained(m)) \
+     for m in ('Organika/sdxl-detector', 'Ateeqq/ai-vs-human-image-detector')]; \
+    print('all weights cached')"
 
 # Make the cache world-readable so the Spaces non-root runtime can read it.
 RUN chmod -R a+rX /app/.cache
