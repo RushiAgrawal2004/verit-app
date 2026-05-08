@@ -14,7 +14,7 @@ logger = logging.getLogger("orchestrator")
 
 DEEPSAFE_URL = os.getenv("DEEPSAFE_URL", "http://localhost:5001").rstrip("/")
 # Optional second image service. When set, image requests are sent to both
-# Spaces in parallel and the probabilities are averaged.
+# Spaces in parallel and combined.
 DEEPSAFE_URL_UF = os.getenv("DEEPSAFE_URL_UF", "").rstrip("/")
 # DEEPSAFE_MODE: "single_model" -> POST /predict with base64 JSON (a single DeepSafe model service)
 #                "orchestrator" -> POST /detect with multipart file (the full DeepSafe API on port 8000)
@@ -22,10 +22,27 @@ DEEPSAFE_MODE = os.getenv("DEEPSAFE_MODE", "single_model").lower()
 VIDEO_URL = os.getenv("VIDEO_URL", "http://localhost:5005").rstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 
+# ── Ensemble tuning (all env-var configurable) ──────────────────────────
+# UF (CLIP ViT-L/14 + linear head) generalizes much better to modern
+# diffusion models (ChatGPT image, Midjourney v6, Flux, Imagen 3) than NPR
+# (ResNet-50 trained mostly on older GAN data). So UF gets the higher weight.
+W_NPR = float(os.getenv("ENSEMBLE_WEIGHT_NPR", "0.30"))
+W_UF = float(os.getenv("ENSEMBLE_WEIGHT_UF", "0.70"))
+# Decision threshold on the weighted probability. Lower than 0.5 because
+# CPU-only detectors trained on older data tend to under-predict on modern
+# AI generators — we accept some false-positive risk to reduce FN.
+AI_THRESHOLD = float(os.getenv("AI_THRESHOLD", "0.40"))
+# Aggressive trip-wire: if ANY single model exceeds this score on its own,
+# flag as AI even if the weighted average doesn't cross AI_THRESHOLD. Set
+# to 1.01 to disable.
+AGGRESSIVE_MAX = float(os.getenv("ENSEMBLE_AGGRESSIVE_MAX", "0.55"))
+# Probability we report when only metadata fires (not from any model).
+METADATA_PROB = float(os.getenv("METADATA_PROB", "0.95"))
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
-app = FastAPI(title="AI Detection Orchestrator", version="1.1.0")
+app = FastAPI(title="AI Detection Orchestrator", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,11 +77,14 @@ def _safe_metadata_check(raw: bytes) -> Optional[MetadataFinding]:
 
 
 def metadata_short_circuit(finding: MetadataFinding) -> dict:
+    # Cap reported probability at METADATA_PROB regardless of finding's own
+    # value, so behaviour is uniform and operator-tunable.
+    prob = max(finding.probability, METADATA_PROB)
     return {
         "type": "image",
         "verdict": "AI",
-        "ai_probability": finding.probability,
-        "confidence": finding.probability,
+        "ai_probability": round(prob, 4),
+        "confidence": round(prob, 4),
         "service": "metadata",
         "details": {
             "metadata_source": finding.source,
@@ -124,27 +144,83 @@ def normalize_image_response_orchestrator(data: dict) -> dict:
     }
 
 
+def _model_weight(label: str) -> float:
+    if label == "npr":
+        return W_NPR
+    if label == "uf":
+        return W_UF
+    return 1.0
+
+
 def normalize_ensemble(model_results: List[Tuple[str, dict]]) -> dict:
-    """model_results = [(label, json_response), ...] in the order called."""
+    """model_results = [(label, json_response), ...] in the order called.
+
+    Decision rule (all configurable via env vars):
+      1. weighted_avg = sum(weight * prob) / sum(weight)
+      2. is_fake if weighted_avg >= AI_THRESHOLD
+                 OR max(individual_probs) >= AGGRESSIVE_MAX
+    """
     probs = [(label, float(r.get("probability", 0.5))) for label, r in model_results]
-    avg = sum(p for _, p in probs) / len(probs)
-    is_fake = avg >= 0.5
+    weights = [_model_weight(label) for label, _ in probs]
+    weighted_sum = sum(w * p for w, (_, p) in zip(weights, probs))
+    total_w = sum(weights) or 1.0
+    weighted_avg = weighted_sum / total_w
+    max_prob = max(p for _, p in probs)
+
+    threshold_trip = weighted_avg >= AI_THRESHOLD
+    max_trip = max_prob >= AGGRESSIVE_MAX
+    is_fake = threshold_trip or max_trip
+
+    # Reported ai_probability is the higher of (weighted_avg, max_prob)
+    # — so a single confident model isn't drowned out by an unsure peer.
+    ai_prob = max(weighted_avg, max_prob if max_trip else 0.0)
+    ai_prob = max(0.0, min(1.0, ai_prob))
+
     components = [
-        {"model": label, "probability": p, "raw_model_id": r.get("model")}
+        {
+            "model": label,
+            "probability": round(p, 4),
+            "weight": _model_weight(label),
+            "raw_model_id": r.get("model"),
+        }
         for (label, p), (_, r) in zip(probs, model_results)
     ]
     service = "ensemble[" + ",".join(label for label, _ in model_results) + "]"
+    strategy = "weighted_avg+max"
     if len(model_results) == 1:
         service = "single[" + model_results[0][0] + "]"
+        strategy = "single"
+
+    decision_reason = []
+    if threshold_trip:
+        decision_reason.append(
+            f"weighted_avg {weighted_avg:.3f} >= AI_THRESHOLD {AI_THRESHOLD:.2f}"
+        )
+    if max_trip:
+        decision_reason.append(
+            f"max_prob {max_prob:.3f} >= AGGRESSIVE_MAX {AGGRESSIVE_MAX:.2f}"
+        )
+    if not decision_reason:
+        decision_reason.append(
+            f"weighted_avg {weighted_avg:.3f} < AI_THRESHOLD {AI_THRESHOLD:.2f}"
+        )
+
     return {
         "type": "image",
         "verdict": "AI" if is_fake else "Real",
-        "ai_probability": avg,
-        "confidence": avg if is_fake else 1.0 - avg,
+        "ai_probability": round(ai_prob, 4),
+        "confidence": round(ai_prob if is_fake else 1.0 - weighted_avg, 4),
         "service": service,
         "details": {
             "components": components,
-            "strategy": "average" if len(model_results) > 1 else "single",
+            "weighted_avg": round(weighted_avg, 4),
+            "max_prob": round(max_prob, 4),
+            "thresholds": {
+                "ai_threshold": AI_THRESHOLD,
+                "aggressive_max": AGGRESSIVE_MAX,
+            },
+            "strategy": strategy,
+            "decision": " AND ".join(decision_reason),
         },
     }
 

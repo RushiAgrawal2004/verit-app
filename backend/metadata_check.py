@@ -171,6 +171,7 @@ _IPTC_AI_DST = re.compile(
 # C2PA AI-generation hints inside JUMBF metadata. C2PA-signed AI images
 # (Firefly, Photoshop Generative Fill, Bing Image Creator, ChatGPT/DALL·E,
 # Google's SynthID-tagged images, Leica/Sony AI cameras) emit these tokens.
+# We also scan for software-agent identifiers and the legacy CAI namespace.
 _C2PA_AI_HINTS = re.compile(
     rb"trainedAlgorithmicMedia"
     rb"|compositeWithTrainedAlgorithmicMedia"
@@ -178,11 +179,24 @@ _C2PA_AI_HINTS = re.compile(
     rb"|algorithmicallyEnhanced"
     rb"|c2pa\.created.{0,400}(generative|ai|trainedAlgorithmic)"
     rb"|c2pa\.ai_generative"
+    rb"|c2pa\.ai_training_mining_prohibited"
     rb"|com\.adobe\.firefly"
     rb"|com\.openai"
+    rb"|com\.openai\.image"
+    rb"|gpt-image-\d"
+    rb"|chat\s*gpt"
     rb"|com\.midjourney"
+    rb"|com\.microsoft\.designer"
+    rb"|com\.microsoft\.bing"
     rb"|stability\.ai"
-    rb"|google\.ai\.generative",
+    rb"|stable[\s_-]?diffusion"
+    rb"|google\.ai\.generative"
+    rb"|com\.google\.gemini"
+    rb"|com\.google\.imagen"
+    rb"|google\.com/models/imagen"
+    rb"|org\.contentauthenticity"
+    rb"|claim_generator.{0,200}(openai|midjourney|stability|firefly|imagen|gemini|designer)"
+    rb"|softwareAgent.{0,200}(openai|midjourney|stability|firefly|imagen|gemini|gpt-image|dall.?e|comfy|automatic)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -265,18 +279,24 @@ def _xmp_check(img: Image.Image) -> Optional[MetadataFinding]:
 
 
 def _c2pa_check(raw: bytes) -> Optional[MetadataFinding]:
-    # JUMBF / C2PA boxes live in the file binary. Scan first ~512KB for
+    # JUMBF / C2PA boxes live in the file binary. Scan first ~1MB for
     # cheap textual hints. Real C2PA verification needs the c2pa SDK; this
     # is a fast positive-only signal.
-    head = raw[: 512 * 1024]
-    if b"jumbf" not in head.lower() and b"c2pa" not in head.lower():
-        return None
+    head = raw[: 1024 * 1024]
+    head_lower = head.lower()
+    has_c2pa_box = (
+        b"jumbf" in head_lower
+        or b"c2pa" in head_lower
+        or b"contentauthenticity" in head_lower
+    )
+    # Even if we don't see a C2PA box marker, ChatGPT/DALL-E sometimes
+    # embed software identifiers as plain XMP/EXIF strings, so still scan.
     m = _C2PA_AI_HINTS.search(head)
     if not m:
         return None
     return MetadataFinding(
-        source="c2pa",
-        field="actions",
+        source="c2pa" if has_c2pa_box else "embedded",
+        field="actions" if has_c2pa_box else "softwareAgent",
         evidence=m.group(0).decode("utf-8", errors="ignore")[:200],
         probability=0.97,
     )
