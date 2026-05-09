@@ -8,7 +8,7 @@ const samples = [
   { url: 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=600&q=80&auto=format&fit=crop', alt: 'Mountain landscape' },
   { url: 'https://images.unsplash.com/photo-1449824913935-59a10b8d2000?w=600&q=80&auto=format&fit=crop', alt: 'Cityscape' },
   { url: 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?w=600&q=80&auto=format&fit=crop', alt: 'Dog' },
-  { url: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=600&q=80&auto=format&fit=crop', alt: 'Laptop' },
+  { url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=600&q=80&auto=format&fit=crop', alt: 'Face' },
   { url: 'https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?w=600&q=80&auto=format&fit=crop', alt: 'Architecture' },
 ];
 
